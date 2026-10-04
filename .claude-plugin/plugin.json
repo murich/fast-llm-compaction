@@ -1,20 +1,55 @@
 {
-  "name": "fast-jev-compaction",
-  "version": "0.3.0",
-  "description": "Verbatim Jev-guided compaction for Claude Code sessions.",
+  "name": "fast-llm-compaction",
+  "version": "0.1.0",
+  "description": "Tool-call summarizing compaction for Claude Code sessions: every tool result over 200 chars becomes one LLM-written sentence of what it found and what follows from it.",
   "license": "MIT",
   "userConfig": {
+    "provider": {
+      "type": "string",
+      "title": "Summarizer provider",
+      "description": "`engine` uses the session's own model provider (no extra key); `http` uses an OpenAI-compatible /chat/completions endpoint.",
+      "default": "engine"
+    },
+    "model": {
+      "type": "string",
+      "title": "Summarizer model",
+      "description": "Model for the one-sentence summaries. `haiku` for provider engine; a model id for provider http. LLM_MODEL overrides the default for http.",
+      "default": "haiku"
+    },
+    "baseUrl": {
+      "type": "string",
+      "title": "Summarizer base URL",
+      "description": "OpenAI-compatible base URL (provider http), e.g. https://llm.example.com/v1. Leave unset to use LLM_BASE_URL."
+    },
     "apiKey": {
       "type": "string",
-      "title": "TypeSafe API key",
-      "description": "TypeSafe API key. Leave unset to use TYPESAFE_API_KEY.",
+      "title": "Summarizer API key",
+      "description": "API key for the endpoint (provider http). Leave unset to use LLM_API_KEY.",
       "sensitive": true
     },
-    "keepThreshold": {
+    "minResultChars": {
       "type": "number",
-      "title": "Keep threshold",
-      "description": "Minimum Jev probability that a tool call or tool result is still needed; below it the item is removed.",
-      "default": 0.5
+      "title": "Minimum result characters",
+      "description": "Tool results at or below this many characters are kept verbatim; only longer ones are summarized.",
+      "default": 200
+    },
+    "maxToolInputChars": {
+      "type": "number",
+      "title": "Maximum tool input characters",
+      "description": "Serialized tool inputs above this many characters are condensed to their informative skeleton.",
+      "default": 200
+    },
+    "maxPromptResultChars": {
+      "type": "number",
+      "title": "Maximum result characters in the prompt",
+      "description": "Characters of a tool result shown to the summarizer.",
+      "default": 6000
+    },
+    "truncateHeadChars": {
+      "type": "number",
+      "title": "Truncated tool result head",
+      "description": "Characters of a tool result kept when summarization fails; 0 keeps only the note.",
+      "default": 300
     },
     "preserveRecentMessages": {
       "type": "number",
@@ -31,32 +66,26 @@
     "minReductionRatio": {
       "type": "number",
       "title": "Minimum reduction ratio",
-      "description": "Minimum estimated character reduction required to replace history.",
+      "description": "Below this estimated reduction the built-in summary runs instead.",
       "default": 0.25
     },
-    "maxStateTokens": {
-      "type": "number",
-      "title": "Maximum Jev state tokens",
-      "description": "Estimated token budget for the conversation state sent with every Jev request.",
-      "default": 25000
+    "preSummarize": {
+      "type": "boolean",
+      "title": "Pre-summarize tool calls",
+      "description": "Summarize tool results as they land (tool.call), so compaction reuses ready sentences.",
+      "default": true
     },
-    "maxRequestTokens": {
+    "preSummarizeAtPercent": {
       "type": "number",
-      "title": "Maximum Jev request tokens",
-      "description": "Estimated token budget for state plus questions in one Jev request.",
-      "default": 30000
+      "title": "Pre-summarize from percentage",
+      "description": "Context percentage from which tool.call starts pre-summarizing; 0 always.",
+      "default": 0
     },
-    "truncateHeadChars": {
+    "concurrency": {
       "type": "number",
-      "title": "Truncated tool result head",
-      "description": "Characters of a tool result kept when Jev decides its full output is no longer needed; 0 keeps only the note.",
-      "default": 300
-    },
-    "model": {
-      "type": "string",
-      "title": "Jev model",
-      "description": "TypeSafe Jev model name.",
-      "default": "jev-latest"
+      "title": "Summarizer concurrency",
+      "description": "How many summarizer calls may be in flight at once.",
+      "default": 4
     }
   }
 }

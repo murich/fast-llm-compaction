@@ -1,13 +1,13 @@
-import { JevClient, type JevClientOptions } from './client.js';
-import { compact } from './compact.js';
-import type { CompactOptions, CompactResult, Message } from './types.js';
+import { compact, type CompactRunOptions } from './compact.js';
+import type { CompactResult, Message, Summarizer } from './types.js';
 
-export type CompactMessagesOptions = CompactOptions & JevClientOptions;
+export type SummarizeMessagesOptions = CompactRunOptions;
 
-/** `compact` with a `JevClient` built from the options (key from `TYPESAFE_API_KEY` by default). */
-export function compactMessages(
+/** `compact` under its public name: one sentence per tool result worth keeping. */
+export function summarizeMessages(
   messages: readonly Message[],
-  options: CompactMessagesOptions = {},
+  summarizer: Summarizer,
+  options: SummarizeMessagesOptions = {},
 ): Promise<CompactResult> {
-  return compact(messages, new JevClient(options), options);
+  return compact(messages, summarizer, options);
 }

@@ -32,7 +32,7 @@ export interface Message {
 
 /** A tool call paired with its result by `tool_use_id`. */
 export interface ToolCall {
-  /** Short id used in the Jev state and question names (`t1`, `t2`, ...). */
+  /** Short id used in the decision log (`t1`, `t2`, ...). */
   id: string;
   tool_use_id: string;
   tool: string;
@@ -41,78 +41,73 @@ export interface ToolCall {
   callIndex: number;
   /** Index of the message holding the tool_result block. */
   resultIndex: number;
+  /** The full result text; what gets replaced by the summary. */
+  resultText: string;
   resultChars: number;
   isError: boolean;
   /** In the first or the newest preserved messages; never a candidate. */
   pinned: boolean;
 }
 
-export interface CallAnswer {
-  /** Jev's probability that the call itself still matters. */
-  keepCall: number;
-  /** Jev's probability that the full result still needs to stay verbatim. */
-  keepResult: number;
+/** What one summarization is asked about. */
+export interface SummarizeInput {
+  /** Short id of the call (`t1`), for logs. */
+  id: string;
+  tool_use_id: string;
+  tool: string;
+  /** The call's input (already condensed when it was long). */
+  input: Record<string, unknown>;
+  /** The tool result to distil, full text; the prompt builder caps it. */
+  resultText: string;
+  isError: boolean;
+  /** The ongoing task, so the summary can say why a finding matters. */
+  goal: string;
 }
 
-export type CallAction = 'keep' | 'drop_result' | 'drop_call';
+/**
+ * The one-sentence distiller. Replaces the upstream `JevAsker`: instead of
+ * scoring whether a call still matters, it states what the call found, why it
+ * matters and what follows from it.
+ */
+export interface Summarizer {
+  summarize(input: SummarizeInput): Promise<string>;
+}
 
-export interface CallDecision extends CallAnswer {
+export type CallAction = 'keep' | 'summarize' | 'truncate';
+
+export interface CallDecision {
   id: string;
   tool: string;
   action: CallAction;
-  reason: 'pinned' | 'kept' | 'result_dropped' | 'call_dropped';
-}
-
-export interface HistoryToolCall {
-  id: string;
-  tool: string;
-  input: string;
-  result: string;
-}
-
-export interface HistoryEntry {
-  i: number;
-  role: Role;
-  text: string;
-  /** Structured per call, or one compact line per call once the state has to shrink. */
-  tool_calls?: HistoryToolCall[] | string[];
-}
-
-/** The state sent with every Jev request: the whole history, results omitted. */
-export interface CompactionState {
-  context: string;
-  goal: string;
-  history: HistoryEntry[];
-}
-
-export interface FittedState {
-  state: CompactionState;
-  tokens: number;
-  /** Which fitting stage produced the state, for diagnostics. */
-  stage: string;
+  reason: 'pinned' | 'small' | 'summarized' | 'summarize_failed';
+  /** Result characters before and after the action. */
+  charsBefore: number;
+  charsAfter: number;
+  /** The sentence kept, when one was produced. */
+  summary?: string;
 }
 
 export interface CompactOptions {
   /** Ongoing task description; defaults to the last few user prompts. */
   goal?: string;
-  /** Minimum keep probability for a call or result to stay. Default 0.5. */
-  keepThreshold?: number;
   /** Newest messages never touched (the first message is always kept). Default 6. */
   preserveRecentMessages?: number;
-  /** Estimated token ceiling for the state. Default 25000. */
-  maxStateTokens?: number;
-  /** Estimated token ceiling for state plus one batch of questions. Default 30000. */
-  maxRequestTokens?: number;
-  /** Characters of a dropped tool result to retain. Default 300. */
+  /** Tool results at or below this many characters stay verbatim. Default 200. */
+  minResultChars?: number;
+  /** Serialized tool inputs above this many characters are condensed. Default 200. */
+  maxToolInputChars?: number;
+  /** Characters of a tool result sent to the summarizer. Default 6000. */
+  maxPromptResultChars?: number;
+  /** Characters of a tool result kept when summarization fails. Default 300. */
   truncateHeadChars?: number;
 }
 
 export interface ResolvedCompactOptions {
   goal: string;
-  keepThreshold: number;
   preserveRecentMessages: number;
-  maxStateTokens: number;
-  maxRequestTokens: number;
+  minResultChars: number;
+  maxToolInputChars: number;
+  maxPromptResultChars: number;
   truncateHeadChars: number;
 }
 
@@ -127,76 +122,23 @@ export interface CompactResult {
     charsAfter: number;
     calls: number;
     kept: number;
-    resultsDropped: number;
-    callsDropped: number;
+    summarized: number;
+    truncated: number;
     pinned: number;
-    stateTokens: number;
-    /** Which fitting stage the state needed, '' when no request was made. */
-    stateStage: string;
+    /** Summarizer calls actually made (cache hits excluded). */
     requests: number;
+    /** Calls whose summarization failed and fell back to a truncated head. */
+    failures: number;
     ms: number;
   };
 }
 
-/** The `state` of a Jev request: a string or any JSON-serialisable object. */
-export type JevState = string | object;
-
-export interface NoulQuestion {
-  type: 'noul';
-  instructions: string;
-  criteria?: {
-    true?: string;
-    false?: string;
-  };
-}
-
-export interface ChoiceQuestion {
-  type: 'choice';
-  instructions: string;
-  criteria: Record<string, string | null>;
-}
-
-export interface ScoreQuestion {
-  type: 'score';
-  instructions: string;
-  criteria: string[];
-}
-
-export type JevQuestion = NoulQuestion | ChoiceQuestion | ScoreQuestion;
-export type JevQuestions = Record<string, JevQuestion>;
-
-export interface NoulAnswer {
-  type?: 'noul';
-  noul: number;
-}
-
-export interface ChoiceAnswer {
-  type?: 'choice';
-  choice: string;
-  confidence: number;
-  probabilities: Record<string, number>;
-}
-
-export interface ScoreAnswer {
-  type?: 'score';
-  score: number;
-  confidence: number;
-  probabilities: Record<string, number>;
-}
-
-export type JevAnswer = NoulAnswer | ChoiceAnswer | ScoreAnswer;
-
-export interface JevResponse {
-  model?: string;
-  answers: Record<string, JevAnswer>;
-  usage?: {
-    input_tokens?: number;
-    output_tokens?: number;
-  };
-  [key: string]: unknown;
-}
-
-/** Anything that can answer Jev questions: `JevClient`, or a host-provided adapter. */
-export interface JevAsker {
-  ask(state: JevState, questions: JevQuestions): Promise<JevResponse>;
-}
+/** The transport `httpSummarizer` speaks: `fetch`, or the engine's `$.http.fetch`. */
+export type HttpFetch = (
+  url: string,
+  init?: {
+    method?: string;
+    headers?: Record<string, string>;
+    body?: string;
+  },
+) => Promise<{ status: number; ok: boolean; text: string }>;

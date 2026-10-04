@@ -1,13 +1,21 @@
 import { describe, expect, it } from 'vitest';
 import {
   compactSession,
-  decisionLog,
   decisionLogLines,
+  engineSummarizer,
+  getHttpConfig,
+  inputFromEvent,
   resolveHookConfig,
   summarize,
   toSessionMessages,
-} from '../hooks/fast-jev.ts';
-import { applyDecisions, collectToolCalls, decideCall, type Message } from '../src/index.js';
+} from '../hooks/fast-llm.ts';
+import {
+  collectToolCalls,
+  httpSummarizer,
+  type Message,
+  type SummarizeInput,
+  type Summarizer,
+} from '../src/index.js';
 
 type SessionMessage = Message & { handle?: string };
 
@@ -37,113 +45,223 @@ function transcript(): SessionMessage[] {
     result('tool-2', 'FAIL b.test.ts: expected 2 to be 3', true),
     message('assistant', 'Fixing now.', { handle: 'h-5' }),
     message('user', 'go ahead', { handle: 'h-6' }),
+    message('assistant', 'Done.', { handle: 'h-7' }),
+    message('user', 'thanks', { handle: 'h-8' }),
+    message('assistant', 'Welcome.', { handle: 'h-9' }),
+    message('user', 'one more', { handle: 'h-10' }),
+    message('assistant', 'Sure.', { handle: 'h-11' }),
+    message('user', 'now', { handle: 'h-12' }),
+    message('assistant', 'Yes.', { handle: 'h-13' }),
   ];
 }
 
-function jevFetch(answer: (name: string) => number, bodies: string[] = []) {
-  return async (_url: string, init?: { body?: string }) => {
-    bodies.push(init?.body ?? '');
-    const { questions } = JSON.parse(init?.body ?? '{}') as { questions: Record<string, unknown> };
-    const answers = Object.fromEntries(
-      Object.keys(questions).map((key) => [key, { type: 'noul', noul: answer(key) }]),
-    );
-    return { status: 200, ok: true, text: JSON.stringify({ answers }) };
-  };
-}
+const sentence: Summarizer = {
+  async summarize(input: SummarizeInput) {
+    return `Summary of ${input.tool_use_id}.`;
+  },
+};
 
 describe('hook config', () => {
   it('reads userConfig values and falls back to defaults', () => {
-    expect(resolveHookConfig({})).toEqual({ compactAtPercent: 60, minReductionRatio: 0.25, model: 'jev-latest' });
-    expect(
-      resolveHookConfig({ apiKey: 'k', keepThreshold: 0.3, maxStateTokens: 1000, model: 'jev-x', goal: 'g', compactAtPercent: 'no' }),
-    ).toEqual({
-      apiKey: 'k',
-      keepThreshold: 0.3,
-      maxStateTokens: 1000,
-      model: 'jev-x',
-      goal: 'g',
+    expect(resolveHookConfig({})).toEqual({
+      provider: 'engine',
+      model: 'haiku',
       compactAtPercent: 60,
       minReductionRatio: 0.25,
+      preSummarize: true,
+      preSummarizeAtPercent: 0,
+      concurrency: 4,
+    });
+    expect(
+      resolveHookConfig({
+        provider: 'http',
+        model: 'llm-x',
+        minResultChars: 500,
+        preSummarize: false,
+        concurrency: 2,
+        baseUrl: 'https://llm.example.com/v1',
+        apiKey: 'k',
+        goal: 'g',
+        compactAtPercent: 'no',
+      }),
+    ).toEqual({
+      provider: 'http',
+      model: 'llm-x',
+      minResultChars: 500,
+      preSummarize: false,
+      preSummarizeAtPercent: 0,
+      concurrency: 2,
+      compactAtPercent: 60,
+      minReductionRatio: 0.25,
+      baseUrl: 'https://llm.example.com/v1',
+      apiKey: 'k',
+      goal: 'g',
     });
   });
 });
 
 describe('session message mapping', () => {
-  it('returns the engine objects for untouched messages and handle-less copies for rebuilt ones', () => {
+  it('returns the engine objects for untouched messages and handle-less copies for rebuilt ones', async () => {
     const messages = transcript();
-    const calls = collectToolCalls(messages, 0);
-    const decisions = [
-      decideCall(calls[0]!, { keepCall: 0.9, keepResult: 0.1 }, { keepThreshold: 0.5 }),
-      decideCall(calls[1]!, { keepCall: 0.9, keepResult: 0.9 }, { keepThreshold: 0.5 }),
-    ];
-    messages[1]!.toolUses[0]!.text = 'x'.repeat(2000);
-    messages[2]!.toolResults![0]!.text = 'x'.repeat(2000);
-    const out = toSessionMessages(messages, applyDecisions(messages, decisions, calls, 300));
-    expect(out).toHaveLength(messages.length);
-    expect(out[0]).toBe(messages[0]);
-    expect(out[1]?.handle).toBeUndefined();
-    expect(out[1]?.toolUses[0]?.text).toMatch(
-      new RegExp(`^${'x'.repeat(300)}\\n\\[fast-jev-compaction truncated 1700 chars`),
-    );
-    expect(out[2]?.handle).toBeUndefined();
-    expect(out[2]?.toolResults?.[0]?.text).toMatch(
-      new RegExp(`^${'x'.repeat(300)}\\n\\[fast-jev-compaction truncated 1700 chars`),
-    );
-    expect(out[2]?.toolResults?.[0]).toMatchObject({ tool_use_id: 'tool-1', isError: false });
-    expect(out[3]).toBe(messages[3]);
-    expect(out[4]).toBe(messages[4]);
-  });
+    const before = new Map(messages.map((m) => [m.role + m.text, m]));
+    const { messages: out } = await compactSession(messages, sentence, resolveHookConfig({}), new Map());
 
-  it('preserves short dropped-result messages and their handles', () => {
-    const messages = transcript();
-    messages[1]!.toolUses[0]!.text = 'y'.repeat(100);
-    messages[2]!.toolResults![0]!.text = 'y'.repeat(100);
-    const calls = collectToolCalls(messages, 0);
-    const decisions = [
-      decideCall(calls[0]!, { keepCall: 0.9, keepResult: 0.1 }, { keepThreshold: 0.5 }),
-      decideCall(calls[1]!, { keepCall: 0.9, keepResult: 0.9 }, { keepThreshold: 0.5 }),
-    ];
-    const out = toSessionMessages(messages, applyDecisions(messages, decisions, calls, 300));
-    expect(out[1]).toBe(messages[1]);
-    expect(out[2]).toBe(messages[2]);
+    // pinned prose keeps its handle
+    const prose = out.find((m) => m.text === 'Fixing now.')!;
+    expect(prose.handle).toBe('h-5');
+
+    // rebuilt tool messages have no handle and carry the summary
+    const rebuiltCall = out.find((m) => m.toolUses.some((u) => u.tool_use_id === 'tool-1'))!;
+    expect(rebuiltCall.handle).toBeUndefined();
+    expect(rebuiltCall.toolUses[0]!.text).toBe('Summary of tool-1.');
+    expect(before.get('usergo ahead')!.handle).toBe('h-6');
   });
 });
 
 describe('compactSession', () => {
-  it('runs the library over the engine fetch and reports the outcome', async () => {
-    const bodies: string[] = [];
-    const config = { ...resolveHookConfig({ preserveRecentMessages: 1 }), apiKey: 'k', model: 'jev-x' };
-    const { result: output, messages } = await compactSession(
+  it('carries the stats and the decisions out', async () => {
+    const { result } = await compactSession(
       transcript(),
-      config,
-      jevFetch((name) => (name === 'call_t2' || name === 'result_t2' ? 0.9 : 0.1), bodies),
+      sentence,
+      resolveHookConfig({ preserveRecentMessages: 0 }),
+      new Map(),
     );
-    expect(bodies).toHaveLength(1);
-    expect(JSON.parse(bodies[0]!).model).toBe('jev-x');
-    expect(output.decisions.map((d) => d.action)).toEqual(['drop_call', 'keep']);
-    expect(messages.map((m) => m.handle)).toEqual(['h-0', 'h-tool-2', 'r-tool-2', 'h-5', 'h-6']);
-    expect(summarize(output)).toMatch(/^\d+% reduction; 1 kept, 1 call_dropped; state ~\d+ tokens \(full\) in 1 request\(s\)$/);
-    expect(decisionLog(output)).toBe('t1:Read:drop_call/call=0.10/result=0.10 t2:Bash:keep/call=0.90/result=0.90');
-    expect(decisionLogLines(output)).toEqual([`decisions: ${decisionLog(output)}`]);
+    expect(result.stats.summarized).toBe(1); // tool-2's result is 35 chars
+    expect(result.stats.requests).toBe(1);
+    expect(summarize(result)).toContain('1 summarized');
+    expect(decisionLogLines(result)[0]).toContain('t1:Read:summarize/1000→');
   });
 
-  it('splits a long decision log into ui.log lines under the host limit', async () => {
-    const config = { ...resolveHookConfig({ preserveRecentMessages: 1 }), apiKey: 'k' };
-    const { result: output } = await compactSession(transcript(), config, jevFetch(() => 0.1));
-    const lines = decisionLogLines(output, 60);
-    expect(lines).toEqual([
-      'decisions (1/2): t1:Read:drop_call/call=0.10/result=0.10',
-      'decisions (2/2): t2:Bash:drop_call/call=0.10/result=0.10',
-    ]);
-    expect(lines.every((line) => line.length <= 60)).toBe(true);
-    expect(decisionLogLines({ ...output, decisions: [] })).toEqual(['decisions: (none)']);
+  it('reuses the pre-summarization cache', async () => {
+    const cache = new Map([['tool-1', 'Cached sentence.']]);
+    const { result, messages } = await compactSession(
+      transcript(),
+      {
+        async summarize() {
+          throw new Error('must not be called for tool-1');
+        },
+      },
+      resolveHookConfig({ preserveRecentMessages: 0 }),
+      cache,
+    );
+    expect(result.stats.requests).toBe(0);
+    const texts = messages.flatMap((m) => (m.toolResults ?? []).map((r) => r.text));
+    expect(texts).toContain('Cached sentence.');
+  });
+});
+
+describe('providers', () => {
+  it('engineSummarizer asks the session model for one sentence', async () => {
+    const requests: Array<{ model: string; prompt: string; system?: string }> = [];
+    const summarizer = engineSummarizer(async (request) => {
+      requests.push(request);
+      return '  One sentence.  ';
+    }, 'haiku', 6000);
+    const summary = await summarizer.summarize({
+      id: 't1',
+      tool_use_id: 'tool-1',
+      tool: 'Read',
+      input: { file_path: 'src/a.ts' },
+      resultText: fileA,
+      isError: false,
+      goal: 'Fix the test',
+    });
+    expect(summary).toBe('One sentence.');
+    expect(requests[0]!.model).toBe('haiku');
+    expect(requests[0]!.prompt).toContain('In one sentence, summarize which key elements and values');
+    expect(requests[0]!.prompt).toContain('Tool call: Read(file_path=src/a.ts)');
   });
 
-  it('throws on a missing key and on failed requests so the hook falls back', async () => {
-    const config = resolveHookConfig({ preserveRecentMessages: 1 });
-    await expect(compactSession(transcript(), config, jevFetch(() => 0))).rejects.toThrow(/TYPESAFE_API_KEY/);
+  it('httpSummarizer posts to /chat/completions and reads the reply', async () => {
+    const calls: Array<{ url: string; body: string; headers: Record<string, string> }> = [];
+    const summarizer = httpSummarizer({
+      baseUrl: 'https://llm.example.com/v1/',
+      apiKey: 'secret',
+      model: 'llm-x',
+      fetch: async (url, init) => {
+        calls.push({
+          url,
+          body: init?.body ?? '',
+          headers: init?.headers ?? {},
+        });
+        return {
+          status: 200,
+          ok: true,
+          text: JSON.stringify({ choices: [{ message: { content: 'From http.' } }] }),
+        };
+      },
+    });
+    const summary = await summarizer.summarize({
+      id: 't1',
+      tool_use_id: 'tool-1',
+      tool: 'Read',
+      input: {},
+      resultText: 'a'.repeat(10_000),
+      isError: false,
+      goal: '',
+    });
+    expect(summary).toBe('From http.');
+    expect(calls[0]!.url).toBe('https://llm.example.com/v1/chat/completions');
+    expect(calls[0]!.headers.authorization).toBe('Bearer secret');
+    expect(JSON.parse(calls[0]!.body).model).toBe('llm-x');
+  });
+
+  it('httpSummarizer fails loudly on an error status', async () => {
+    const summarizer = httpSummarizer({
+      baseUrl: 'https://llm.example.com/v1',
+      model: 'llm-x',
+      fetch: async () => ({ status: 403, ok: false, text: '<html>blocked</html>' }),
+    });
     await expect(
-      compactSession(transcript(), { ...config, apiKey: 'k' }, async () => ({ status: 500, ok: false, text: 'x' })),
-    ).rejects.toThrow(/500/);
+      summarizer.summarize({
+        id: 't1',
+        tool_use_id: 'tool-1',
+        tool: 'Read',
+        input: {},
+        resultText: 'text',
+        isError: false,
+        goal: '',
+      }),
+    ).rejects.toThrow(/HTTP 403/);
+  });
+
+  it('getHttpConfig reads config first, then env, then settings', async () => {
+    const $ = {
+      env: { get: async (name: string) => (name === 'LLM_MODEL' ? 'env-model' : undefined) },
+      settings: {
+        read: async () => ({ env: { LLM_BASE_URL: 'https://from-settings/v1' } }),
+      },
+    };
+    const config = resolveHookConfig({ provider: 'http' });
+    expect(await getHttpConfig($, config)).toEqual({
+      baseUrl: 'https://from-settings/v1',
+      model: 'env-model',
+    });
+    expect(
+      await getHttpConfig($, {
+        ...config,
+        baseUrl: 'https://explicit/v1',
+        model: 'explicit-model',
+        apiKey: 'k',
+      }),
+    ).toEqual({ baseUrl: 'https://explicit/v1', model: 'explicit-model', apiKey: 'k' });
+  });
+});
+
+describe('inputFromEvent', () => {
+  it('strips the envelope keys and keeps the arguments', () => {
+    expect(
+      inputFromEvent({ tool: 'Bash', tool_use_id: 't', agentId: 'a', command: 'npm test', timeout: 5 }),
+    ).toEqual({ command: 'npm test', timeout: 5 });
+  });
+});
+
+describe('collectToolCalls', () => {
+  it('pairs calls with results and marks pinned ones', () => {
+    const calls = collectToolCalls(transcript(), 6);
+    expect(calls.map((c) => c.id)).toEqual(['t1', 't2']);
+    expect(calls[0]!.resultChars).toBe(fileA.length);
+    expect(calls.every((c) => !c.pinned)).toBe(true);
+    expect(collectToolCalls(transcript(), 20).every((c) => c.pinned)).toBe(true);
   });
 });

@@ -1,15 +1,15 @@
 {
-  "name": "fast-jev-compaction",
+  "name": "fast-llm-compaction",
   "owner": {
-    "name": "tamaratran",
-    "url": "https://github.com/tamaratran"
+    "name": "murich",
+    "url": "https://github.com/murich"
   },
   "plugins": [
     {
-      "name": "fast-jev-compaction",
+      "name": "fast-llm-compaction",
       "source": "./",
-      "description": "Verbatim Jev-guided compaction for Claude Code sessions.",
-      "version": "0.3.0",
+      "description": "Tool-call summarizing compaction for Claude Code sessions.",
+      "version": "0.1.0",
       "license": "MIT"
     }
   ]
