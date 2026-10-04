@@ -2,8 +2,7 @@ import { describe, expect, it } from 'vitest';
 import {
   compactSession,
   decisionLogLines,
-  engineSummarizer,
-  getHttpConfig,
+  buildSummarizer,
   inputFromEvent,
   resolveHookConfig,
   summarize,
@@ -11,7 +10,7 @@ import {
 } from '../hooks/fast-llm.ts';
 import {
   collectToolCalls,
-  httpSummarizer,
+  forkSummarizer,
   type Message,
   type SummarizeInput,
   type Summarizer,
@@ -64,8 +63,6 @@ const sentence: Summarizer = {
 describe('hook config', () => {
   it('reads userConfig values and falls back to defaults', () => {
     expect(resolveHookConfig({})).toEqual({
-      provider: 'engine',
-      model: 'haiku',
       compactAtPercent: 60,
       minReductionRatio: 0.25,
       preSummarize: true,
@@ -74,27 +71,19 @@ describe('hook config', () => {
     });
     expect(
       resolveHookConfig({
-        provider: 'http',
-        model: 'llm-x',
         minResultChars: 500,
         preSummarize: false,
         concurrency: 2,
-        baseUrl: 'https://llm.example.com/v1',
-        apiKey: 'k',
         goal: 'g',
         compactAtPercent: 'no',
       }),
     ).toEqual({
-      provider: 'http',
-      model: 'llm-x',
       minResultChars: 500,
       preSummarize: false,
       preSummarizeAtPercent: 0,
       concurrency: 2,
       compactAtPercent: 60,
       minReductionRatio: 0.25,
-      baseUrl: 'https://llm.example.com/v1',
-      apiKey: 'k',
       goal: 'g',
     });
   });
@@ -150,101 +139,74 @@ describe('compactSession', () => {
   });
 });
 
-describe('providers', () => {
-  it('engineSummarizer asks the session model for one sentence', async () => {
-    const requests: Array<{ model: string; prompt: string; system?: string }> = [];
-    const summarizer = engineSummarizer(async (request) => {
-      requests.push(request);
-      return '  One sentence.  ';
-    }, 'haiku', 6000);
-    const summary = await summarizer.summarize({
-      id: 't1',
-      tool_use_id: 'tool-1',
-      tool: 'Read',
-      input: { file_path: 'src/a.ts' },
-      resultText: fileA,
-      isError: false,
-      goal: 'Fix the test',
-    });
+describe('the session model as summarizer', () => {
+  const input: SummarizeInput = {
+    id: 't1',
+    tool_use_id: 'tool-1',
+    tool: 'Read',
+    input: { file_path: 'src/a.ts' },
+    resultText: fileA,
+    isError: false,
+    goal: 'Fix the test',
+  };
+
+  it('forkSummarizer asks the session model and returns the trimmed reply', async () => {
+    const prompts: string[] = [];
+    const summarizer = forkSummarizer(async (request) => {
+      prompts.push(request.prompt);
+      return { text: '  One sentence.  ' };
+    }, 6000);
+    const summary = await summarizer.summarize(input);
     expect(summary).toBe('One sentence.');
-    expect(requests[0]!.model).toBe('haiku');
-    expect(requests[0]!.prompt).toContain('In one sentence, summarize which key elements and values');
-    expect(requests[0]!.prompt).toContain('Tool call: Read(file_path=src/a.ts)');
+    expect(prompts[0]).toContain('Side question from the context-compaction plugin');
+    expect(prompts[0]).toContain('In one sentence, summarize which key elements and values');
+    expect(prompts[0]).toContain('Tool call Read(file_path=src/a.ts)');
+    expect(prompts[0]).toContain('Tool result (1000 chars)');
+    expect(prompts[0]).toContain('Task context: Fix the test');
+    expect(prompts[0]).toContain(fileA.slice(0, 40));
+    expect(prompts[0]).toContain('Answer with that one sentence only.');
   });
 
-  it('httpSummarizer posts to /chat/completions and reads the reply', async () => {
-    const calls: Array<{ url: string; body: string; headers: Record<string, string> }> = [];
-    const summarizer = httpSummarizer({
-      baseUrl: 'https://llm.example.com/v1/',
-      apiKey: 'secret',
-      model: 'llm-x',
-      fetch: async (url, init) => {
-        calls.push({
-          url,
-          body: init?.body ?? '',
-          headers: init?.headers ?? {},
-        });
-        return {
-          status: 200,
-          ok: true,
-          text: JSON.stringify({ choices: [{ message: { content: 'From http.' } }] }),
-        };
+  it('puts the tool result in front of the model even when the fork snapshot is stale', async () => {
+    const prompts: string[] = [];
+    const summarizer = forkSummarizer(async (request) => {
+      prompts.push(request.prompt);
+      return { text: 'Sentence.' };
+    }, 6000);
+    await summarizer.summarize({ ...input, resultText: 'x'.repeat(10_000) });
+    // capped at maxPromptResultChars, but the length note tells the whole size
+    expect(prompts[0]).toContain('Tool result (10000 chars)');
+    expect(prompts[0]!.length).toBeLessThan(10_000);
+  });
+
+  it('fails loudly when the fork has nothing to say', async () => {
+    const summarizer = forkSummarizer(async () => null, 6000);
+    await expect(summarizer.summarize(input)).rejects.toThrow(/no summary/);
+    const blank = forkSummarizer(async () => ({ text: '   ' }), 6000);
+    await expect(blank.summarize(input)).rejects.toThrow(/no summary/);
+  });
+
+  it('buildSummarizer wires $.model.fork', async () => {
+    const calls: Array<{ prompt: string }> = [];
+    const summarizer = buildSummarizer(
+      {
+        model: {
+          fork: async (request) => {
+            calls.push(request);
+            return { text: 'Via fork.' };
+          },
+        },
+        ui: { log: () => {}, toast: () => {} },
+        session: {
+          usage: async () => ({ context: {} }),
+          compact: async () => ({}),
+          messages: async () => [],
+        },
       },
-    });
-    const summary = await summarizer.summarize({
-      id: 't1',
-      tool_use_id: 'tool-1',
-      tool: 'Read',
-      input: {},
-      resultText: 'a'.repeat(10_000),
-      isError: false,
-      goal: '',
-    });
-    expect(summary).toBe('From http.');
-    expect(calls[0]!.url).toBe('https://llm.example.com/v1/chat/completions');
-    expect(calls[0]!.headers.authorization).toBe('Bearer secret');
-    expect(JSON.parse(calls[0]!.body).model).toBe('llm-x');
-  });
-
-  it('httpSummarizer fails loudly on an error status', async () => {
-    const summarizer = httpSummarizer({
-      baseUrl: 'https://llm.example.com/v1',
-      model: 'llm-x',
-      fetch: async () => ({ status: 403, ok: false, text: '<html>blocked</html>' }),
-    });
-    await expect(
-      summarizer.summarize({
-        id: 't1',
-        tool_use_id: 'tool-1',
-        tool: 'Read',
-        input: {},
-        resultText: 'text',
-        isError: false,
-        goal: '',
-      }),
-    ).rejects.toThrow(/HTTP 403/);
-  });
-
-  it('getHttpConfig reads config first, then env, then settings', async () => {
-    const $ = {
-      env: { get: async (name: string) => (name === 'LLM_MODEL' ? 'env-model' : undefined) },
-      settings: {
-        read: async () => ({ env: { LLM_BASE_URL: 'https://from-settings/v1' } }),
-      },
-    };
-    const config = resolveHookConfig({ provider: 'http' });
-    expect(await getHttpConfig($, config)).toEqual({
-      baseUrl: 'https://from-settings/v1',
-      model: 'env-model',
-    });
-    expect(
-      await getHttpConfig($, {
-        ...config,
-        baseUrl: 'https://explicit/v1',
-        model: 'explicit-model',
-        apiKey: 'k',
-      }),
-    ).toEqual({ baseUrl: 'https://explicit/v1', model: 'explicit-model', apiKey: 'k' });
+      resolveHookConfig({ maxPromptResultChars: 500 }),
+    );
+    expect(await summarizer.summarize(input)).toBe('Via fork.');
+    expect(calls[0]!.prompt).toContain('In one sentence, summarize');
   });
 });
 

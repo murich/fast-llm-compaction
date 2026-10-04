@@ -67,7 +67,8 @@ export interface SummarizeInput {
 /**
  * The one-sentence distiller. Replaces the upstream `JevAsker`: instead of
  * scoring whether a call still matters, it states what the call found, why it
- * matters and what follows from it.
+ * matters and what follows from it. The implementation of record is
+ * `forkSummarizer` — the session's own model answering over its own context.
  */
 export interface Summarizer {
   summarize(input: SummarizeInput): Promise<string>;
@@ -132,13 +133,3 @@ export interface CompactResult {
     ms: number;
   };
 }
-
-/** The transport `httpSummarizer` speaks: `fetch`, or the engine's `$.http.fetch`. */
-export type HttpFetch = (
-  url: string,
-  init?: {
-    method?: string;
-    headers?: Record<string, string>;
-    body?: string;
-  },
-) => Promise<{ status: number; ok: boolean; text: string }>;

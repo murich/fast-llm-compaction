@@ -1,32 +1,9 @@
 {
   "name": "fast-llm-compaction",
   "version": "0.1.0",
-  "description": "Tool-call summarizing compaction for Claude Code sessions: every tool result over 200 chars becomes one LLM-written sentence of what it found and what follows from it.",
+  "description": "Tool-call summarizing compaction for Claude Code sessions: every tool result over 200 chars becomes one sentence from the session's own model — what it found, why it matters, what follows from it.",
   "license": "MIT",
   "userConfig": {
-    "provider": {
-      "type": "string",
-      "title": "Summarizer provider",
-      "description": "`engine` uses the session's own model provider (no extra key); `http` uses an OpenAI-compatible /chat/completions endpoint.",
-      "default": "engine"
-    },
-    "model": {
-      "type": "string",
-      "title": "Summarizer model",
-      "description": "Model for the one-sentence summaries. `haiku` for provider engine; a model id for provider http. LLM_MODEL overrides the default for http.",
-      "default": "haiku"
-    },
-    "baseUrl": {
-      "type": "string",
-      "title": "Summarizer base URL",
-      "description": "OpenAI-compatible base URL (provider http), e.g. https://llm.example.com/v1. Leave unset to use LLM_BASE_URL."
-    },
-    "apiKey": {
-      "type": "string",
-      "title": "Summarizer API key",
-      "description": "API key for the endpoint (provider http). Leave unset to use LLM_API_KEY.",
-      "sensitive": true
-    },
     "minResultChars": {
       "type": "number",
       "title": "Minimum result characters",
@@ -41,14 +18,14 @@
     },
     "maxPromptResultChars": {
       "type": "number",
-      "title": "Maximum result characters in the prompt",
-      "description": "Characters of a tool result shown to the summarizer.",
+      "title": "Maximum result characters in the question",
+      "description": "Characters of a tool result put in front of the session model with the question.",
       "default": 6000
     },
     "truncateHeadChars": {
       "type": "number",
       "title": "Truncated tool result head",
-      "description": "Characters of a tool result kept when summarization fails; 0 keeps only the note.",
+      "description": "Characters of a tool result kept when no summary could be obtained; 0 keeps only the note.",
       "default": 300
     },
     "preserveRecentMessages": {
@@ -71,20 +48,20 @@
     },
     "preSummarize": {
       "type": "boolean",
-      "title": "Pre-summarize tool calls",
-      "description": "Summarize tool results as they land (tool.call), so compaction reuses ready sentences.",
+      "title": "Ask as tool calls land",
+      "description": "Put the question to the session model as tool results arrive (tool.call), so compaction reuses ready sentences.",
       "default": true
     },
     "preSummarizeAtPercent": {
       "type": "number",
-      "title": "Pre-summarize from percentage",
-      "description": "Context percentage from which tool.call starts pre-summarizing; 0 always.",
+      "title": "Ask from percentage",
+      "description": "Context percentage from which tool.call starts asking; 0 always.",
       "default": 0
     },
     "concurrency": {
       "type": "number",
-      "title": "Summarizer concurrency",
-      "description": "How many summarizer calls may be in flight at once.",
+      "title": "Question concurrency",
+      "description": "How many questions to the session model may be in flight at once.",
       "default": 4
     }
   }

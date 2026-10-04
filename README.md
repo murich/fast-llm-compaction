@@ -1,28 +1,40 @@
 # fast-llm-compaction
 
 Claude Code plugin that replaces the compaction summary with one-sentence
-summaries of tool results. Instead of asking the model to rewrite the session
+summaries of tool results — written by **the session's own model**, the one
+that did the work. Instead of asking the model to rewrite the whole session
 into a paraphrase (or asking a decision model which calls to delete), every
-tool result worth keeping becomes **one LLM-written sentence**: which key
-elements and values were found, why they matter for the task, and what follows
-from them. Everything else in the transcript stays word for word.
+tool result worth keeping becomes **one sentence**: which key elements and
+values were found, why they matter for the task, and what follows from them.
+Everything else in the transcript stays word for word.
 
 A fork of [tamaratran/fast-jev-compaction](https://github.com/tamaratran/fast-jev-compaction)
-with the Jev decision layer swapped for plain LLM summarization. Same seam,
-same triggers, same fallbacks; no TypeSafe account, no third-party scoring API.
+with the Jev decision layer swapped for self-summarization. Same seam, same
+triggers, same fallbacks; no TypeSafe account, no third-party model — only the
+session's own model and context.
+
+## Why the session model and not a cheap one
+
+Only the agent knows what a tool result means *for the task*. A small
+sidecar model can say what the text contains; it cannot say which values
+matter or what conclusion follows. So the question is put to the session's
+model through `$.model.fork`: one completion over the session's own
+transcript, with the session's own model and system prompt, sharing the main
+thread's prompt cache. The agent is simply forced to verbalize what it found.
 
 ## What it does
 
-- **`tool.call` (pre-summarization).** As tool calls land, any result over
-  `minResultChars` (200) characters is sent to a cheap model with the
-  summarization question. The sentence is cached per `tool_use_id`, so it is
-  paid for once and compaction later is instant.
+- **`tool.call` (asking as work happens).** As tool calls land, any result over
+  `minResultChars` (200) characters gets the question, answered by the session
+  model through a fork. The sentence is cached per `tool_use_id`, so it is
+  asked once and compaction later is instant. The tool result is put in front
+  of the model with the question, so a stale fork snapshot cannot blind it.
 - **`session.compact` (the compaction).** When `/compact`, auto-compaction or
   the plugin's own trigger fires, the transcript is rebuilt:
   - the first message and the newest `preserveRecentMessages` (6) are pinned;
   - tool results at or below 200 characters stay verbatim;
   - longer tool results are replaced by their one sentence (from cache, or
-    summarized on the spot);
+    asked on the spot);
   - long tool calls are condensed to their informative skeleton (short strings
     elided, bulky structures become size notes) — but **the call itself always
     survives**, so the assistant never narrates work whose record is gone;
@@ -30,20 +42,29 @@ same triggers, same fallbacks; no TypeSafe account, no third-party scoring API.
 - **`turn.complete` (the trigger).** At `compactAtPercent` (60%) context usage
   the plugin requests a compaction, same as upstream.
 - **Fallback.** If the estimated reduction is below `minReductionRatio` (25%),
-  or the summarizer fails outright, Claude Code's built-in summary runs
-  instead — the standard `/compact` path. You never end up with no compaction.
+  or the model fails outright, Claude Code's built-in summary runs instead —
+  the standard `/compact` path. You never end up with no compaction.
 
 ## The question
 
-Each summarized tool call is asked this, with the task context, the call's
-input and its result:
+Each summarized tool call is put to the session model like this (the exact
+question the plugin asks):
 
+> Side question from the context-compaction plugin. Do not continue the task,
+> do not use tools, and do not comment on this question; answer it directly.
+>
+> Task context: …
+>
+> Tool call Read(file_path=src/a.ts). Tool result (1000 chars): …
+>
 > In one sentence, summarize which key elements and values were found in the
 > tool response, why these key elements are important for us, and which
 > conclusion you make in the context of our task based on this response.
+> Answer with that one sentence only.
 
-Only the answer survives into the compacted transcript; the question itself
-never enters the context.
+The fork question is transient — it is not a message in the visible
+conversation, so there is nothing to purge later. Only the agent's answer is
+kept, and it is kept where the tool result was.
 
 ## Install
 
@@ -64,45 +85,27 @@ claude plugin install fast-llm-compaction@fast-llm-compaction
 Restart Claude Code or run `/reload-plugins`. From a checkout without
 installing: `CLAUDE_CODE_ENABLE_FUNCTION_HOOKS=1 claude --plugin-dir .`
 
-## Summarizer providers
-
-| Provider | How it runs | What you need |
-|---|---|---|
-| `engine` (default) | `$.model.complete` on the session's own model provider, `haiku` by default | nothing — no second API key |
-| `http` | any OpenAI-compatible `/chat/completions` endpoint (local model, gateway, hosted) | `baseUrl` + optional `apiKey`, or `LLM_BASE_URL` / `LLM_API_KEY` / `LLM_MODEL` |
-
-For `http`, the endpoint and key come from the plugin's `userConfig` first,
-then the environment, then `settings.json`'s `env` block.
-
 ## Options
 
 | Option | Default | What it does |
 |---|---|---|
-| `provider` | `engine` | `engine` or `http` summarizer |
-| `model` | `haiku` | Summarizer model (`LLM_MODEL` overrides the default for `http`) |
-| `baseUrl` / `apiKey` | — | OpenAI-compatible endpoint and key (`http` only) |
 | `minResultChars` | `200` | Results at or below this stay verbatim |
 | `maxToolInputChars` | `200` | Serialized tool inputs above this are condensed |
-| `maxPromptResultChars` | `6000` | Result characters shown to the summarizer |
-| `truncateHeadChars` | `300` | Head kept when summarization fails |
+| `maxPromptResultChars` | `6000` | Result characters put in front of the model with the question |
+| `truncateHeadChars` | `300` | Head kept when no summary could be obtained |
 | `preserveRecentMessages` | `6` | Newest messages pinned |
 | `compactAtPercent` | `60` | Context percentage that triggers compaction |
 | `minReductionRatio` | `0.25` | Below this reduction the built-in summary runs |
-| `preSummarize` | `true` | Summarize results as they land |
-| `preSummarizeAtPercent` | `0` | Context percentage from which to pre-summarize |
-| `concurrency` | `4` | Summarizer calls in flight at once |
+| `preSummarize` | `true` | Ask as tool results land |
+| `preSummarizeAtPercent` | `0` | Context percentage from which to ask |
+| `concurrency` | `4` | Questions in flight at once |
 
 ## As a library
 
 ```ts
-import { summarizeMessages, httpSummarizer, reductionRatio, type Message } from 'fast-llm-compaction';
+import { summarizeMessages, forkSummarizer, reductionRatio, type Message } from 'fast-llm-compaction';
 
-const summarizer = httpSummarizer({
-  baseUrl: 'https://llm.example.com/v1',
-  model: 'llm-x',
-  fetch: globalThis.fetch as never,
-});
-
+const summarizer = forkSummarizer($.model.fork, 6000);
 const result = await summarizeMessages(transcript, summarizer, { cache: new Map() });
 console.log(result.messages, result.decisions, result.stats);
 if (reductionRatio(result) < 0.25) {
@@ -113,8 +116,8 @@ if (reductionRatio(result) < 0.25) {
 `Message` is a subset of Claude Code's `SessionMessage`, so a session JSONL
 goes in as is. To bring your own transport or model, implement `Summarizer`
 (one `summarize(input)` method returning a sentence). The building blocks
-(`collectToolCalls`, `condenseInput`, `applyDecisions`) are exported
-individually.
+(`collectToolCalls`, `condenseInput`, `applyDecisions`, `buildSummarizePrompt`)
+are exported individually.
 
 ## Development
 
@@ -129,11 +132,11 @@ npm run build
 
 | | fast-jev-compaction | fast-llm-compaction |
 |---|---|---|
-| Decision maker | TypeSafe Jev (cloud, per-call keep/drop probabilities) | any LLM, one sentence per result |
-| What happens to a result | kept verbatim, truncated to 300 chars, or deleted with its call | replaced by its one-sentence summary |
+| Decision maker | TypeSafe Jev (cloud, per-call keep/drop probabilities) | the session's own model, one sentence per result |
+| What happens to a result | kept verbatim, truncated to 300 chars, or deleted with its call | replaced by the agent's own one-sentence summary |
 | Tool calls | can be deleted wholesale | always kept, condensed when long |
-| Requires | `TYPESAFE_API_KEY` | nothing (`engine`) or your own endpoint (`http`) |
-| Pre-summarization | no | yes, on `tool.call`, cached per call |
+| Requires | `TYPESAFE_API_KEY` | nothing |
+| When the decision is made | at compaction time | as the work happens (and on demand at compaction) |
 | Fallback | built-in summary | built-in summary, same thresholds |
 
 Deleting calls wholesale (upstream's `drop_call`) is what leaves the assistant
@@ -144,16 +147,17 @@ deliberate.
 
 - A one-sentence summary is lossy by design. It keeps conclusions and key
   values, not full contents; re-run the tool if the details are needed again.
-- The pre-summarization cache is per process. A summary made early reflects
-  the task context known at that moment; set `preSummarizeAtPercent` if you
-  only want summaries once the session is under way.
-- Each summarized result costs one small-model call. Results under 200
-  characters cost nothing.
+- Each question is one completion over the session's cached transcript
+  (cheap in cache-read tokens, but not free). Set `preSummarizeAtPercent` to
+  ask only once the session is under way, or `preSummarize: false` to ask
+  only at compaction time.
+- A fork is null on a cold transcript (before the first turn) and on API
+  errors; those calls fall back to a bounded truncated head.
+- The one-sentence answer reflects the task understanding at the moment it
+  was asked; a mid-session pivot can make earlier sentences stale.
 - `--resume` and compaction-boundary behavior are Claude Code function-hook
   territory and identical to upstream's — nothing here fixes what the engine
   does not expose.
-- With `provider: engine` the summarizer bills the session's own account.
-  With `provider: http` your tool results go to the endpoint you configure.
 
 ## Credits
 

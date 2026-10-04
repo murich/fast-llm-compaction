@@ -1,20 +1,19 @@
-import type {
-  HttpFetch,
-  SummarizeInput,
-  Summarizer,
-} from './types.js';
+import type { SummarizeInput, Summarizer } from './types.js';
 import { truncate } from './state.js';
 
 /**
- * The question the plugin asks about every tool call worth asking about. The
- * answer is what survives into the compacted transcript.
+ * The side question the plugin puts to the session's own model about every
+ * tool call worth asking about. The model that answers is the one that did
+ * the work — same model, same conversation context — so the sentence carries
+ * its judgement of what the result means for the task. The reply is what
+ * survives into the compacted transcript.
  */
-export const SUMMARIZE_SYSTEM =
-  'You distil tool outputs for a coding agent whose context window is being compacted. ' +
-  'You answer with exactly one sentence and nothing else: no preamble, no label, no quotes.';
+export const SUMMARIZE_PREAMBLE =
+  'Side question from the context-compaction plugin. Do not continue the task, do not use ' +
+  'tools, and do not comment on this question; answer it directly.';
 
 export function buildSummarizePrompt(input: SummarizeInput, maxPromptResultChars: number): string {
-  const goal = input.goal.trim() || '(no user request captured yet)';
+  const goal = input.goal.trim();
   const args = Object.entries(input.input)
     .map(([key, value]) => {
       const text = typeof value === 'string' ? value : JSON.stringify(value);
@@ -23,17 +22,21 @@ export function buildSummarizePrompt(input: SummarizeInput, maxPromptResultChars
     .join(' ');
   const result = truncate(input.resultText, maxPromptResultChars);
   return [
-    `Task context: ${goal}`,
-    '',
-    `Tool call: ${input.tool}(${truncate(args, 600)})`,
-    `Tool result (${input.resultText.length} chars${input.isError ? ', tool reported an error' : ''}):`,
+    SUMMARIZE_PREAMBLE,
+    goal ? `\nTask context: ${goal}` : '',
+    `Tool call ${input.tool}(${truncate(args, 600)}).`,
+    `Tool result (${input.resultText.length} chars${
+      input.isError ? ', tool reported an error' : ''
+    }):`,
     result,
     '',
     'In one sentence, summarize which key elements and values were found in the tool response, ' +
       'why these key elements are important for us, and which conclusion you make in the context ' +
       'of our task based on this response.',
     'Answer with that one sentence only.',
-  ].join('\n');
+  ]
+    .filter((line) => line !== '')
+    .join('\n');
 }
 
 const STRING_VALUE_CHARS = 80;
@@ -108,89 +111,29 @@ export function condenseInput(
   return kept;
 }
 
-export interface HttpSummarizerOptions {
-  /** OpenAI-compatible base URL, e.g. `https://llm.example.com/v1`. */
-  baseUrl: string;
-  apiKey?: string;
-  model: string;
-  maxTokens?: number;
-  /** Characters of the tool result shown to the model. Default 6000. */
-  maxPromptResultChars?: number;
-  fetch: HttpFetch;
-  /** Extra request body fields (temperature, etc.). */
-  extraBody?: Record<string, unknown>;
-}
+/** What `$.model.fork` does: one completion over the session's own transcript. */
+export type ModelFork = (request: { prompt: string }) => Promise<{ text: string } | null>;
 
 /**
- * A `Summarizer` over any OpenAI-compatible `/chat/completions` endpoint —
- * a local model, a gateway, or a hosted one.
+ * A `Summarizer` on the session's own model and context. The question is put
+ * to the model that did the work — `complete` would be a stranger to the task,
+ * and a smaller model would not know what matters.
  */
-export function httpSummarizer(options: HttpSummarizerOptions): Summarizer {
-  const base = options.baseUrl.replace(/\/+$/, '');
-  return {
-    async summarize(input) {
-      const body = {
-        model: options.model,
-        max_tokens: options.maxTokens ?? 128,
-        messages: [
-          { role: 'system', content: SUMMARIZE_SYSTEM },
-          {
-            role: 'user',
-            content: buildSummarizePrompt(input, options.maxPromptResultChars ?? 6000),
-          },
-        ],
-        ...options.extraBody,
-      };
-      const response = await options.fetch(`${base}/chat/completions`, {
-        method: 'POST',
-        headers: {
-          'content-type': 'application/json',
-          ...(options.apiKey ? { authorization: `Bearer ${options.apiKey}` } : {}),
-        },
-        body: JSON.stringify(body),
-      });
-      if (!response.ok) {
-        throw new Error(`summarizer HTTP ${response.status}: ${truncate(response.text, 200)}`);
-      }
-      let parsed: {
-        choices?: Array<{ message?: { content?: unknown } }>;
-        error?: { message?: unknown };
-      };
-      try {
-        parsed = JSON.parse(response.text);
-      } catch {
-        throw new Error(`summarizer returned non-JSON: ${truncate(response.text, 200)}`);
-      }
-      const content = parsed.choices?.[0]?.message?.content;
-      if (typeof content !== 'string' || content.trim().length === 0) {
-        throw new Error(
-          `summarizer returned no content: ${truncate(response.text, 200)}`,
-        );
-      }
-      return content.trim();
-    },
-  };
-}
-
-/** Replaces a result with its cached sentence; on a miss, asks and caches. */
-export function cachedSummarizer(
-  inner: Summarizer,
-  cache: Map<string, string>,
-  counter?: { requests: number },
+export function forkSummarizer(
+  fork: ModelFork,
+  maxPromptResultChars: number,
 ): Summarizer {
   return {
-    async summarize(input) {
-      const hit = cache.get(input.tool_use_id);
-      if (hit !== undefined) return hit;
-      const summary = await inner.summarize(input);
-      cache.set(input.tool_use_id, summary);
-      if (counter) counter.requests += 1;
+    async summarize(input: SummarizeInput): Promise<string> {
+      const reply = await fork({ prompt: buildSummarizePrompt(input, maxPromptResultChars) });
+      const summary = reply?.text.trim() ?? '';
+      if (!summary) throw new Error('the session model returned no summary');
       return summary;
     },
   };
 }
 
-/** Runs `worker` over `items` with at most `limit` in flight, in input order of completion. */
+/** Runs `worker` over `items` with at most `limit` in flight. */
 export async function pooledMap<T, R>(
   items: readonly T[],
   limit: number,

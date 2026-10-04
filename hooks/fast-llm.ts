@@ -10,7 +10,7 @@ import type {
 
 import { compact, reductionRatio, resolveOptions, type CompactRunOptions } from '../src/compact.js';
 import { goalFromMessages, truncate } from '../src/state.js';
-import { buildSummarizePrompt, httpSummarizer, SUMMARIZE_SYSTEM } from '../src/summarize.js';
+import { forkSummarizer, type ModelFork } from '../src/summarize.js';
 import type {
   CompactResult,
   Message,
@@ -21,8 +21,6 @@ import type {
 } from '../src/types.js';
 
 const HOOK_DEFAULTS = {
-  provider: 'engine',
-  model: 'haiku',
   compactAtPercent: 60,
   minReductionRatio: 0.25,
   preSummarize: true,
@@ -31,19 +29,11 @@ const HOOK_DEFAULTS = {
 };
 
 export type HookConfig = CompactRunOptions & {
-  /** `engine` uses the session's own model provider; `http` an OpenAI-compatible endpoint. */
-  provider: 'engine' | 'http';
-  /** Model for the summarizer (`haiku` for `engine`; a model id for `http`). */
-  model: string;
-  /** OpenAI-compatible base URL, `http` only. */
-  baseUrl?: string;
-  /** API key for the endpoint, `http` only. */
-  apiKey?: string;
   compactAtPercent: number;
   minReductionRatio: number;
-  /** Summarize tool results as they land, so compaction reuses ready sentences. */
+  /** Ask the session model as tool results land, so compaction reuses ready sentences. */
   preSummarize: boolean;
-  /** Context percentage from which `tool.call` starts pre-summarizing. Default 0. */
+  /** Context percentage from which `tool.call` starts asking. Default 0. */
   preSummarizeAtPercent: number;
   concurrency: number;
 };
@@ -76,11 +66,8 @@ export function resolveHookConfig(options: PluginOptions): HookConfig {
     const value = options[key];
     if (typeof value === 'number' && Number.isFinite(value)) numbers[key] = value;
   }
-  const provider = optionString(options, 'provider');
   const config: HookConfig = {
     ...numbers,
-    provider: provider === 'http' ? 'http' : 'engine',
-    model: optionString(options, 'model') ?? HOOK_DEFAULTS.model,
     compactAtPercent: optionNumber(options, 'compactAtPercent', HOOK_DEFAULTS.compactAtPercent),
     minReductionRatio: optionNumber(
       options,
@@ -95,42 +82,21 @@ export function resolveHookConfig(options: PluginOptions): HookConfig {
     ),
     concurrency: Math.max(1, optionNumber(options, 'concurrency', HOOK_DEFAULTS.concurrency)),
   };
-  const apiKey = optionString(options, 'apiKey');
-  if (apiKey) config.apiKey = apiKey;
-  const baseUrl = optionString(options, 'baseUrl');
-  if (baseUrl) config.baseUrl = baseUrl;
   const goal = optionString(options, 'goal');
   if (goal) config.goal = goal;
   return config;
 }
 
-/** What the engine's `$.model.complete` needs; the hook passes the real one. */
-export type ModelComplete = (request: {
-  model: string;
-  prompt: string;
-  system?: string;
-  maxTokens?: number;
-}) => Promise<string>;
-
-/** A `Summarizer` on the session's own model provider — no second API key. */
-export function engineSummarizer(
-  complete: ModelComplete,
-  model: string,
-  maxPromptResultChars: number,
-): Summarizer {
-  return {
-    async summarize(input: SummarizeInput): Promise<string> {
-      const text = await complete({
-        model,
-        prompt: buildSummarizePrompt(input, maxPromptResultChars),
-        system: SUMMARIZE_SYSTEM,
-        maxTokens: 200,
-      });
-      const summary = text.trim();
-      if (!summary) throw new Error('summarizer model returned an empty reply');
-      return summary;
-    },
-  };
+/**
+ * The summarizer of record: `$.model.fork` — the session's own model over the
+ * session's own transcript, sharing the main thread's prompt cache. Only the
+ * model that did the work knows what a result means for the task.
+ */
+export function buildSummarizer($: Host, config: HookConfig): Summarizer {
+  return forkSummarizer(
+    (request) => $.model.fork(request),
+    config.maxPromptResultChars ?? 6000,
+  );
 }
 
 function toolUseSummary(tool: ToolUse): ToolUseSummary {
@@ -192,7 +158,7 @@ export type SessionCompaction = {
   messages: SessionMessage[];
 };
 
-/** Runs the library over a session transcript; throws when the summarizer fails outright. */
+/** Runs the library over a session transcript; throws when the model fails outright. */
 export async function compactSession(
   messages: readonly SessionMessage[],
   summarizer: Summarizer,
@@ -215,12 +181,12 @@ export function summarize(result: CompactResult): string {
   const { stats } = result;
   const parts = [
     stats.summarized > 0 ? `${stats.summarized} summarized` : '',
-    stats.truncated > 0 ? `${stats.truncated} truncated (summarizer failed)` : '',
+    stats.truncated > 0 ? `${stats.truncated} truncated (no summary)` : '',
     stats.kept > 0 ? `${stats.kept} kept verbatim` : '',
   ].filter(Boolean);
   return `${percent(reductionRatio(result))} reduction; ${
     parts.join(', ') || 'no tool calls'
-  }; ${stats.requests} summarizer call(s) in ${stats.ms} ms`;
+  }; ${stats.requests} model fork(s) in ${stats.ms} ms`;
 }
 
 const UI_LOG_MAX_CHARS = 4096;
@@ -255,50 +221,8 @@ export function decisionLogLines(
   );
 }
 
-type HostEnv = {
-  env: { get: (name: string) => Promise<string | undefined> };
-  settings: { read: () => Promise<Readonly<Record<string, unknown>>> };
-};
-
-function settingsEnv(
-  settings: Readonly<Record<string, unknown>>,
-  name: string,
-): string | undefined {
-  const env = settings['env'];
-  if (env && typeof env === 'object') {
-    const value = (env as Record<string, unknown>)[name];
-    if (typeof value === 'string' && value) return value;
-  }
-  return undefined;
-}
-
-/** Resolves the `http` provider's endpoint and key from userConfig, then env, then settings. */
-export async function getHttpConfig(
-  $: HostEnv,
-  config: HookConfig,
-): Promise<{ baseUrl: string; apiKey?: string; model: string }> {
-  const settings = await $.settings.read();
-  const baseUrl =
-    config.baseUrl ??
-    (await $.env.get('LLM_BASE_URL')) ??
-    settingsEnv(settings, 'LLM_BASE_URL');
-  if (!baseUrl) throw new Error('provider http needs a baseUrl (or LLM_BASE_URL)');
-  const apiKey = config.apiKey ?? (await $.env.get('LLM_API_KEY')) ?? settingsEnv(settings, 'LLM_API_KEY');
-  const model =
-    config.model !== HOOK_DEFAULTS.model
-      ? config.model
-      : ((await $.env.get('LLM_MODEL')) ?? settingsEnv(settings, 'LLM_MODEL') ?? config.model);
-  return { baseUrl, ...(apiKey ? { apiKey } : {}), model };
-}
-
-type Host = HostEnv & {
-  http: {
-    fetch: (
-      url: string,
-      init?: { method?: string; headers?: Record<string, string>; body?: string },
-    ) => Promise<{ status: number; ok: boolean; text: string }>;
-  };
-  model: { complete: ModelComplete };
+type Host = {
+  model: { fork: ModelFork };
   ui: {
     log: (text: string) => void;
     toast: (text: string, options?: { timeoutMs?: number }) => void;
@@ -309,24 +233,6 @@ type Host = HostEnv & {
     messages: () => Promise<readonly SessionMessage[]>;
   };
 };
-
-async function buildSummarizer($: Host, config: HookConfig): Promise<Summarizer> {
-  if (config.provider === 'http') {
-    const http = await getHttpConfig($, config);
-    return httpSummarizer({
-      baseUrl: http.baseUrl,
-      apiKey: http.apiKey,
-      model: http.model,
-      maxPromptResultChars: config.maxPromptResultChars,
-      fetch: (url, init) => $.http.fetch(url, init),
-    });
-  }
-  return engineSummarizer(
-    (request) => $.model.complete(request),
-    config.model,
-    config.maxPromptResultChars ?? 6000,
-  );
-}
 
 function notify(
   $: {
@@ -351,7 +257,7 @@ export function inputFromEvent(event: Record<string, unknown>): Record<string, u
   return input;
 }
 
-/** The task context for a summary made outside compaction; refreshed lazily. */
+/** The task context for a question asked outside compaction; refreshed lazily. */
 type GoalState = { goal: string; at: number };
 
 async function recentGoal($: Host, config: HookConfig, state: GoalState): Promise<string> {
@@ -375,7 +281,7 @@ export const register: Register = (on: On, options: PluginOptions) => {
 
   on('session.compact', async ($, event, next) => {
     try {
-      const summarizer = await buildSummarizer($ as unknown as Host, configured);
+      const summarizer = buildSummarizer($ as unknown as Host, configured);
       const { result, messages } = await compactSession(
         event.messages,
         summarizer,
@@ -422,7 +328,7 @@ export const register: Register = (on: On, options: PluginOptions) => {
       const { context } = await $.session.usage();
       if ((context.percent ?? 0) < configured.preSummarizeAtPercent) return result;
 
-      const summarizer = await buildSummarizer($ as unknown as Host, configured);
+      const summarizer = buildSummarizer($ as unknown as Host, configured);
       const input: SummarizeInput = {
         id: toolUseId,
         tool_use_id: toolUseId,
@@ -440,7 +346,7 @@ export const register: Register = (on: On, options: PluginOptions) => {
         })
         .catch((error) => {
           $.ui.log(
-            `pre-summarize skipped for ${truncate(input.tool, 40)} (${truncate(
+            `summary skipped for ${truncate(input.tool, 40)} (${truncate(
               error instanceof Error ? error.message : String(error),
               120,
             )})`,

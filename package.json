@@ -1,7 +1,7 @@
 {
   "name": "fast-llm-compaction",
   "version": "0.1.0",
-  "description": "Tool-call summarizing compaction for Claude Code: every tool result over 200 chars becomes one LLM-written sentence of what it found and what follows from it.",
+  "description": "Tool-call summarizing compaction for Claude Code: every tool result over 200 chars becomes one sentence from the session's own model — what it found, why it matters, what follows from it.",
   "type": "module",
   "license": "MIT",
   "engines": {
