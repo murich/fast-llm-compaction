@@ -1,5 +1,5 @@
 import { collectToolCalls, goalFromMessages } from './state.js';
-import { condenseInput, pooledMap } from './summarize.js';
+import { chunked, condenseInput, pooledMap } from './summarize.js';
 import type {
   CallDecision,
   CompactOptions,
@@ -23,6 +23,9 @@ export const DEFAULT_OPTIONS: ResolvedCompactOptions = {
 
 /** How many summarizer calls may be in flight at once. */
 export const DEFAULT_CONCURRENCY = 4;
+
+/** How many tool calls one batch question asks about. */
+export const DEFAULT_BATCH_SIZE = 10;
 
 function finite(value: number | undefined, fallback: number): number {
   return typeof value === 'number' && Number.isFinite(value) ? value : fallback;
@@ -97,6 +100,8 @@ export interface CompactRunOptions extends CompactOptions {
   cache?: Map<string, string>;
   /** Summarizer calls in flight at once. Default 4. */
   concurrency?: number;
+  /** Tool calls per batch question. Default 10. */
+  batchSize?: number;
 }
 
 /**
@@ -127,25 +132,59 @@ export async function compact(
   let requests = 0;
   const outcomes = new Map<string, { summary?: string; error?: Error }>();
   const pending = candidates.filter((call) => !cache?.has(call.tool_use_id));
+  const inputFor = (call: ToolCall): SummarizeInput => ({
+    id: call.id,
+    tool_use_id: call.tool_use_id,
+    tool: call.tool,
+    input: call.input,
+    resultText: call.resultText,
+    isError: call.isError,
+    goal,
+  });
+
+  // One batch question per series of calls: the context behind the question
+  // is paid once. Whatever the batch does not answer is asked individually;
+  // a batch that failed outright is retried call by call.
+  let rest: ToolCall[] = pending;
+  if (summarizer.summarizeBatch && pending.length > 1) {
+    const chunks = chunked(pending, options.batchSize ?? DEFAULT_BATCH_SIZE);
+    const batches = await pooledMap(
+      chunks,
+      options.concurrency ?? DEFAULT_CONCURRENCY,
+      async (chunk) => {
+        requests += 1;
+        return (summarizer.summarizeBatch as NonNullable<Summarizer['summarizeBatch']>)(
+          chunk.map(inputFor),
+        );
+      },
+    );
+    rest = [];
+    batches.forEach((outcome, index) => {
+      const chunk = chunks[index] as ToolCall[];
+      if (outcome instanceof Error) {
+        rest.push(...chunk);
+        return;
+      }
+      for (const call of chunk) {
+        const summary = outcome.get(call.tool_use_id)?.trim();
+        if (summary) {
+          outcomes.set(call.tool_use_id, { summary });
+          cache?.set(call.tool_use_id, summary);
+        } else rest.push(call);
+      }
+    });
+  }
+
   const answered = await pooledMap(
-    pending,
+    rest,
     options.concurrency ?? DEFAULT_CONCURRENCY,
     async (call) => {
       requests += 1;
-      const input: SummarizeInput = {
-        id: call.id,
-        tool_use_id: call.tool_use_id,
-        tool: call.tool,
-        input: call.input,
-        resultText: call.resultText,
-        isError: call.isError,
-        goal,
-      };
-      return summarizer.summarize(input);
+      return summarizer.summarize(inputFor(call));
     },
   );
   answered.forEach((outcome, index) => {
-    const call = pending[index] as ToolCall;
+    const call = rest[index] as ToolCall;
     if (outcome instanceof Error) outcomes.set(call.tool_use_id, { error: outcome });
     else {
       const summary = outcome.trim();

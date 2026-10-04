@@ -10,7 +10,7 @@ import type {
 
 import { compact, reductionRatio, resolveOptions, type CompactRunOptions } from '../src/compact.js';
 import { goalFromMessages, truncate } from '../src/state.js';
-import { forkSummarizer, type ModelFork } from '../src/summarize.js';
+import { chunked, forkSummarizer, pooledMap, type ModelFork } from '../src/summarize.js';
 import type {
   CompactResult,
   Message,
@@ -26,6 +26,7 @@ const HOOK_DEFAULTS = {
   preSummarize: true,
   preSummarizeAtPercent: 0,
   concurrency: 4,
+  batchSize: 10,
 };
 
 export type HookConfig = CompactRunOptions & {
@@ -36,6 +37,8 @@ export type HookConfig = CompactRunOptions & {
   /** Context percentage from which `tool.call` starts asking. Default 0. */
   preSummarizeAtPercent: number;
   concurrency: number;
+  /** Tool calls per batch question. Default 10. */
+  batchSize: number;
 };
 
 function optionNumber(options: PluginOptions, key: string, fallback: number): number {
@@ -81,6 +84,7 @@ export function resolveHookConfig(options: PluginOptions): HookConfig {
       HOOK_DEFAULTS.preSummarizeAtPercent,
     ),
     concurrency: Math.max(1, optionNumber(options, 'concurrency', HOOK_DEFAULTS.concurrency)),
+    batchSize: Math.max(1, optionNumber(options, 'batchSize', HOOK_DEFAULTS.batchSize)),
   };
   const goal = optionString(options, 'goal');
   if (goal) config.goal = goal;
@@ -97,6 +101,40 @@ export function buildSummarizer($: Host, config: HookConfig): Summarizer {
     (request) => $.model.fork(request),
     config.maxPromptResultChars ?? 6000,
   );
+}
+
+/**
+ * Puts a series of pending questions to the session model — one fork per
+ * `batchSize` calls, so the context behind the question is paid once per
+ * series. Whatever comes back lands in the cache; anything missing is simply
+ * left for compaction to ask again (or truncate).
+ */
+export async function flushPending(
+  items: readonly SummarizeInput[],
+  summarizer: Summarizer,
+  cache: Map<string, string>,
+  batchSize: number,
+  concurrency: number,
+  onError?: (error: Error) => void,
+): Promise<void> {
+  const chunks = chunked(items, batchSize);
+  const results = await pooledMap(chunks, concurrency, async (chunk) => {
+    const answered = summarizer.summarizeBatch
+      ? await summarizer.summarizeBatch(chunk)
+      : new Map(
+          await Promise.all(
+            chunk.map(
+              async (item) => [item.tool_use_id, await summarizer.summarize(item)] as const,
+            ),
+          ),
+        );
+    for (const [id, summary] of answered) {
+      if (summary.trim()) cache.set(id, summary.trim());
+    }
+  });
+  for (const outcome of results) {
+    if (outcome instanceof Error && onError) onError(outcome);
+  }
 }
 
 function toolUseSummary(tool: ToolUse): ToolUseSummary {
@@ -272,12 +310,35 @@ async function recentGoal($: Host, config: HookConfig, state: GoalState): Promis
   return state.goal;
 }
 
+/**
+ * Puts the accumulated series to the session model: one fork per batch, so
+ * the context behind the question is paid once per series.
+ */
+function drainPending(
+  $: Host,
+  config: HookConfig,
+  cache: Map<string, string>,
+  pending: SummarizeInput[],
+  onError: (error: Error) => void,
+): Promise<void> {
+  const items = pending.splice(0, pending.length);
+  if (items.length === 0) return Promise.resolve();
+  return flushPending(
+    items,
+    buildSummarizer($, config),
+    cache,
+    config.batchSize,
+    config.concurrency,
+    onError,
+  );
+}
+
 export const register: Register = (on: On, options: PluginOptions) => {
   const configured = resolveHookConfig(options);
   const cache = new Map<string, string>();
   const goalState: GoalState = { goal: configured.goal ?? '', at: 0 };
+  const pending: SummarizeInput[] = [];
   let compacting = false;
-  let inFlight = 0;
 
   on('session.compact', async ($, event, next) => {
     try {
@@ -321,15 +382,14 @@ export const register: Register = (on: On, options: PluginOptions) => {
         typeof toolUseId !== 'string' ||
         text.length <= (configured.minResultChars ?? 200) ||
         cache.has(toolUseId) ||
-        inFlight >= configured.concurrency
+        pending.some((item) => item.tool_use_id === toolUseId)
       ) {
         return result;
       }
       const { context } = await $.session.usage();
       if ((context.percent ?? 0) < configured.preSummarizeAtPercent) return result;
 
-      const summarizer = buildSummarizer($ as unknown as Host, configured);
-      const input: SummarizeInput = {
+      pending.push({
         id: toolUseId,
         tool_use_id: toolUseId,
         tool: String((event as unknown as { tool?: unknown }).tool ?? 'tool'),
@@ -337,24 +397,16 @@ export const register: Register = (on: On, options: PluginOptions) => {
         resultText: text,
         isError: false,
         goal: await recentGoal($ as unknown as Host, configured, goalState),
-      };
-      inFlight += 1;
-      void summarizer
-        .summarize(input)
-        .then((summary) => {
-          if (summary.trim()) cache.set(toolUseId, summary.trim());
-        })
-        .catch((error) => {
-          $.ui.log(
-            `summary skipped for ${truncate(input.tool, 40)} (${truncate(
-              error instanceof Error ? error.message : String(error),
-              120,
-            )})`,
-          );
-        })
-        .finally(() => {
-          inFlight -= 1;
-        });
+      });
+      if (pending.length >= configured.batchSize) {
+        void drainPending(
+          $ as unknown as Host,
+          configured,
+          cache,
+          pending,
+          (error) => $.ui.log(`summary batch skipped (${truncate(error.message, 120)})`),
+        );
+      }
     } catch {
       /* never disturb the tool call for the sake of a summary */
     }
@@ -362,6 +414,17 @@ export const register: Register = (on: On, options: PluginOptions) => {
   });
 
   on('turn.complete', async ($, event: TurnCompleteInput, next) => {
+    try {
+      await drainPending(
+        $ as unknown as Host,
+        configured,
+        cache,
+        pending,
+        (error) => $.ui.log(`summary batch skipped (${truncate(error.message, 120)})`),
+      );
+    } catch {
+      /* compaction re-asks whatever was not summarized */
+    }
     if (compacting) return next(event);
     try {
       const { context } = await $.session.usage();

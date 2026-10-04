@@ -203,6 +203,98 @@ describe('compact', () => {
   });
 });
 
+describe('batch questions', () => {
+  function bigCall(id: string): Message[] {
+    return [call(id, 'Read', { file_path: `src/${id}.ts` }, fileA), result(id, fileA)];
+  }
+
+  function batchTranscript(count: number): Message[] {
+    const messages = [message('user', 'Audit the parser.')];
+    for (let i = 1; i <= count; i++) messages.push(...bigCall(`tool-${i}`));
+    messages.push(...transcript().slice(-6));
+    return messages;
+  }
+
+  it('asks about many calls in one question and fills gaps individually', async () => {
+    const batches: SummarizeInput[][] = [];
+    const singles: SummarizeInput[] = [];
+    const summarizer: Summarizer = {
+      async summarize(input) {
+        singles.push(input);
+        return `Single ${input.tool_use_id}.`;
+      },
+      async summarizeBatch(inputs) {
+        batches.push([...inputs]);
+        const map = new Map<string, string>();
+        for (const [index, input] of inputs.entries()) {
+          if (batches.length === 1 && index === 0) continue; // leave one unanswered
+          map.set(input.tool_use_id, `Batch ${input.tool_use_id}.`);
+        }
+        return map;
+      },
+    };
+    const run = await compact(batchTranscript(3), summarizer, { batchSize: 10 });
+
+    expect(batches).toHaveLength(1);
+    expect(batches[0]!.map((i) => i.tool_use_id)).toEqual(['tool-1', 'tool-2', 'tool-3']);
+    expect(singles.map((i) => i.tool_use_id)).toEqual(['tool-1']);
+    const texts = run.messages.flatMap((m) => (m.toolResults ?? []).map((r) => r.text));
+    expect(texts).toContain('Single tool-1.');
+    expect(texts).toContain('Batch tool-2.');
+    expect(texts).toContain('Batch tool-3.');
+    expect(run.stats.requests).toBe(2); // one batch question, one single
+  });
+
+  it('chunks calls into batches of batchSize', async () => {
+    const batches: SummarizeInput[][] = [];
+    const summarizer: Summarizer = {
+      async summarize(input) {
+        return `Single ${input.tool_use_id}.`;
+      },
+      async summarizeBatch(inputs) {
+        batches.push([...inputs]);
+        return new Map(inputs.map((i) => [i.tool_use_id, `Batch ${i.tool_use_id}.`]));
+      },
+    };
+    await compact(batchTranscript(5), summarizer, { batchSize: 2, concurrency: 1 });
+    expect(batches.map((b) => b.length)).toEqual([2, 2, 1]);
+  });
+
+  it('retries call by call when a batch question fails outright', async () => {
+    const singles: string[] = [];
+    const summarizer: Summarizer = {
+      async summarize(input) {
+        singles.push(input.tool_use_id);
+        return `Single ${input.tool_use_id}.`;
+      },
+      async summarizeBatch() {
+        throw new Error('fork died');
+      },
+    };
+    const run = await compact(batchTranscript(2), summarizer, { batchSize: 10 });
+    expect(singles.sort()).toEqual(['tool-1', 'tool-2']);
+    expect(run.stats.summarized).toBe(2);
+    expect(run.stats.failures).toBe(0);
+  });
+
+  it('truncates what the batch left unanswered and the single question could not answer', async () => {
+    const summarizer: Summarizer = {
+      async summarize(input) {
+        if (input.tool_use_id === 'tool-2') throw new Error('no');
+        return `Single ${input.tool_use_id}.`;
+      },
+      async summarizeBatch() {
+        return new Map();
+      },
+    };
+    const run = await compact(batchTranscript(2), summarizer, { batchSize: 10 });
+    const texts = run.messages.flatMap((m) => (m.toolResults ?? []).map((r) => r.text));
+    expect(texts.some((t) => t.includes('[fast-llm-compaction truncated'))).toBe(true);
+    expect(run.stats.truncated).toBe(1);
+    expect(run.stats.summarized).toBe(1);
+  });
+});
+
 describe('condenseInput', () => {
   it('returns the input unchanged when it fits', () => {
     const input = { file_path: 'src/a.ts' };

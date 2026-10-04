@@ -25,16 +25,18 @@ thread's prompt cache. The agent is simply forced to verbalize what it found.
 ## What it does
 
 - **`tool.call` (asking as work happens).** As tool calls land, any result over
-  `minResultChars` (200) characters gets the question, answered by the session
-  model through a fork. The sentence is cached per `tool_use_id`, so it is
-  asked once and compaction later is instant. The tool result is put in front
-  of the model with the question, so a stale fork snapshot cannot blind it.
+  `minResultChars` (200) characters joins the pending series; the series goes
+  to the session model as **one question per `batchSize` (10) calls**, flushed
+  when the batch fills or the turn ends. Sentences are cached per
+  `tool_use_id`, so they are asked once and compaction later is instant. Each
+  tool result is put in front of the model with the question, so a stale fork
+  snapshot cannot blind it.
 - **`session.compact` (the compaction).** When `/compact`, auto-compaction or
   the plugin's own trigger fires, the transcript is rebuilt:
   - the first message and the newest `preserveRecentMessages` (6) are pinned;
   - tool results at or below 200 characters stay verbatim;
   - longer tool results are replaced by their one sentence (from cache, or
-    asked on the spot);
+    asked on the spot — batched the same way, one question per series);
   - long tool calls are condensed to their informative skeleton (short strings
     elided, bulky structures become size notes) — but **the call itself always
     survives**, so the assistant never narrates work whose record is gone;
@@ -65,6 +67,13 @@ question the plugin asks):
 The fork question is transient — it is not a message in the visible
 conversation, so there is nothing to purge later. Only the agent's answer is
 kept, and it is kept where the tool result was.
+
+For a series of calls the same question is asked once for the whole series,
+with a strict reply format (`tool_use_id: sentence` per line). Batching is
+what makes this cheap: the context behind the question is paid **once per
+series**, not once per tool call — a completion forks over the session's
+transcript, so without batching every question would re-read the whole
+context.
 
 ## Install
 
@@ -99,6 +108,7 @@ installing: `CLAUDE_CODE_ENABLE_FUNCTION_HOOKS=1 claude --plugin-dir .`
 | `preSummarize` | `true` | Ask as tool results land |
 | `preSummarizeAtPercent` | `0` | Context percentage from which to ask |
 | `concurrency` | `4` | Questions in flight at once |
+| `batchSize` | `10` | Tool calls per batch question |
 
 ## As a library
 
@@ -148,9 +158,10 @@ deliberate.
 - A one-sentence summary is lossy by design. It keeps conclusions and key
   values, not full contents; re-run the tool if the details are needed again.
 - Each question is one completion over the session's cached transcript
-  (cheap in cache-read tokens, but not free). Set `preSummarizeAtPercent` to
-  ask only once the session is under way, or `preSummarize: false` to ask
-  only at compaction time.
+  (cheap in cache-read tokens, but not free). Batching keeps it to one
+  completion per `batchSize` calls; set `preSummarizeAtPercent` to ask only
+  once the session is under way, or `preSummarize: false` to ask only at
+  compaction time.
 - A fork is null on a cold transcript (before the first turn) and on API
   errors; those calls fall back to a bounded truncated head.
 - The one-sentence answer reflects the task understanding at the moment it

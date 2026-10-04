@@ -63,6 +63,12 @@
       "title": "Question concurrency",
       "description": "How many questions to the session model may be in flight at once.",
       "default": 4
+    },
+    "batchSize": {
+      "type": "number",
+      "title": "Tool calls per question",
+      "description": "How many tool calls one batch question asks about; the context behind the question is paid once per batch.",
+      "default": 10
     }
   }
 }

@@ -72,6 +72,13 @@ export interface SummarizeInput {
  */
 export interface Summarizer {
   summarize(input: SummarizeInput): Promise<string>;
+  /**
+   * Optional batch mode: one question about many calls, so the context behind
+   * the question is paid once. Returns the sentences it got, keyed by
+   * `tool_use_id`; a missing key means the caller should fall back to
+   * `summarize` for that call. Throws when the whole batch failed.
+   */
+  summarizeBatch?(inputs: readonly SummarizeInput[]): Promise<Map<string, string>>;
 }
 
 export type CallAction = 'keep' | 'summarize' | 'truncate';
@@ -126,7 +133,7 @@ export interface CompactResult {
     summarized: number;
     truncated: number;
     pinned: number;
-    /** Summarizer calls actually made (cache hits excluded). */
+    /** Questions actually asked (a batch counts as one; cache hits excluded). */
     requests: number;
     /** Calls whose summarization failed and fell back to a truncated head. */
     failures: number;

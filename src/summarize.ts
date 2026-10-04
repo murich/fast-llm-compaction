@@ -114,10 +114,79 @@ export function condenseInput(
 /** What `$.model.fork` does: one completion over the session's own transcript. */
 export type ModelFork = (request: { prompt: string }) => Promise<{ text: string } | null>;
 
+function callLine(input: SummarizeInput, maxPromptResultChars: number): string {
+  const args = Object.entries(input.input)
+    .map(([key, value]) => {
+      const text = typeof value === 'string' ? value : JSON.stringify(value);
+      return `${key}=${truncate(text ?? 'null', 200).replace(/\s+/g, ' ')}`;
+    })
+    .join(' ');
+  const result = truncate(input.resultText, maxPromptResultChars);
+  return [
+    `--- tool_use_id=${input.tool_use_id}`,
+    `Tool call ${input.tool}(${truncate(args, 600)}).`,
+    `Tool result (${input.resultText.length} chars${
+      input.isError ? ', tool reported an error' : ''
+    }):`,
+    result,
+  ].join('\n');
+}
+
+const BATCH_INSTRUCTIONS =
+  'For each tool call below, in one sentence, summarize which key elements and values were ' +
+  'found in the tool response, why these key elements are important for us, and which ' +
+  'conclusion you make in the context of our task based on this response.\n' +
+  'Reply with exactly one line per tool call, in the order given, in the form ' +
+  '`tool_use_id: sentence`, and nothing else.';
+
+/**
+ * The batch question: many calls, one fork. The context behind the question
+ * is paid once instead of once per call.
+ */
+export function buildBatchPrompt(
+  inputs: readonly SummarizeInput[],
+  maxPromptResultChars: number,
+): string {
+  const goal = inputs.find((input) => input.goal.trim())?.goal.trim() ?? '';
+  return [
+    SUMMARIZE_PREAMBLE,
+    goal ? `\nTask context: ${goal}` : '',
+    `${inputs.length} tool call(s) to summarize:\n`,
+    inputs.map((input) => callLine(input, maxPromptResultChars)).join('\n'),
+    '',
+    BATCH_INSTRUCTIONS,
+  ]
+    .filter((line) => line !== '')
+    .join('\n');
+}
+
+/**
+ * Pulls the sentences out of a batch reply: `tool_use_id: sentence` per line,
+ * tolerating a leading `[n]` marker or a dash bullet. Unknown ids and
+ * unparseable lines are ignored; the caller falls back per missing call.
+ */
+export function parseBatchReply(
+  text: string,
+  ids: Iterable<string>,
+): Map<string, string> {
+  const known = new Set(ids);
+  const out = new Map<string, string>();
+  for (const raw of text.split('\n')) {
+    const line = raw.replace(/^\s*(?:\d+[.)]\s+|[-*]\s+|\[\d+\]\s*)?/, '').trim();
+    const match = /^`?([\w.:-]+)`?\s*[:：—-]\s*(.+)$/.exec(line);
+    if (!match) continue;
+    const id = (match[1] ?? '').replace(/[:：—-]+$/, '');
+    const sentence = (match[2] ?? '').trim();
+    if (known.has(id) && sentence && !out.has(id)) out.set(id, sentence);
+  }
+  return out;
+}
+
 /**
  * A `Summarizer` on the session's own model and context. The question is put
  * to the model that did the work — `complete` would be a stranger to the task,
- * and a smaller model would not know what matters.
+ * and a smaller model would not know what matters. `summarizeBatch` asks
+ * about a whole series of calls in one fork.
  */
 export function forkSummarizer(
   fork: ModelFork,
@@ -130,7 +199,23 @@ export function forkSummarizer(
       if (!summary) throw new Error('the session model returned no summary');
       return summary;
     },
+    async summarizeBatch(inputs) {
+      const reply = await fork({ prompt: buildBatchPrompt(inputs, maxPromptResultChars) });
+      const text = reply?.text.trim() ?? '';
+      if (!text) throw new Error('the session model returned no summary');
+      return parseBatchReply(text, inputs.map((input) => input.tool_use_id));
+    },
   };
+}
+
+/** Splits `items` into arrays of at most `size`. */
+export function chunked<T>(items: readonly T[], size: number): T[][] {
+  const chunks: T[][] = [];
+  const width = Math.max(1, size);
+  for (let i = 0; i < items.length; i += width) {
+    chunks.push(items.slice(i, i + width) as T[]);
+  }
+  return chunks;
 }
 
 /** Runs `worker` over `items` with at most `limit` in flight. */

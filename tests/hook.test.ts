@@ -3,14 +3,17 @@ import {
   compactSession,
   decisionLogLines,
   buildSummarizer,
+  flushPending,
   inputFromEvent,
   resolveHookConfig,
   summarize,
   toSessionMessages,
 } from '../hooks/fast-llm.ts';
 import {
+  buildBatchPrompt,
   collectToolCalls,
   forkSummarizer,
+  parseBatchReply,
   type Message,
   type SummarizeInput,
   type Summarizer,
@@ -68,12 +71,14 @@ describe('hook config', () => {
       preSummarize: true,
       preSummarizeAtPercent: 0,
       concurrency: 4,
+      batchSize: 10,
     });
     expect(
       resolveHookConfig({
         minResultChars: 500,
         preSummarize: false,
         concurrency: 2,
+        batchSize: 3,
         goal: 'g',
         compactAtPercent: 'no',
       }),
@@ -82,6 +87,7 @@ describe('hook config', () => {
       preSummarize: false,
       preSummarizeAtPercent: 0,
       concurrency: 2,
+      batchSize: 3,
       compactAtPercent: 60,
       minReductionRatio: 0.25,
       goal: 'g',
@@ -207,6 +213,86 @@ describe('the session model as summarizer', () => {
     );
     expect(await summarizer.summarize(input)).toBe('Via fork.');
     expect(calls[0]!.prompt).toContain('In one sentence, summarize');
+  });
+});
+
+describe('batch question and reply', () => {
+  const inputs: SummarizeInput[] = [
+    {
+      id: 't1',
+      tool_use_id: 'tool-1',
+      tool: 'Read',
+      input: { file_path: 'src/a.ts' },
+      resultText: fileA,
+      isError: false,
+      goal: 'Fix the test',
+    },
+    {
+      id: 't2',
+      tool_use_id: 'tool-2',
+      tool: 'Bash',
+      input: { command: 'npm test' },
+      resultText: 'FAIL b.test.ts',
+      isError: true,
+      goal: 'Fix the test',
+    },
+  ];
+
+  it('buildBatchPrompt lists every call with its result and the strict reply format', () => {
+    const prompt = buildBatchPrompt(inputs, 6000);
+    expect(prompt).toContain('Side question from the context-compaction plugin');
+    expect(prompt).toContain('2 tool call(s) to summarize');
+    expect(prompt).toContain('--- tool_use_id=tool-1');
+    expect(prompt).toContain('--- tool_use_id=tool-2');
+    expect(prompt).toContain('Tool result (14 chars, tool reported an error)');
+    expect(prompt).toContain('`tool_use_id: sentence`');
+  });
+
+  it('parseBatchReply pulls sentences and ignores junk', () => {
+    const parsed = parseBatchReply(
+      [
+        'Here are the summaries:',
+        '1. tool-1: The file defines the parser and it is the one under test.',
+        '- `tool-2` — the test fails on line 3, so the fixture is wrong.',
+        'tool-9: not one of our calls.',
+        'tool-1: second line for the same call is ignored',
+      ].join('\n'),
+      ['tool-1', 'tool-2'],
+    );
+    expect(parsed.get('tool-1')).toBe('The file defines the parser and it is the one under test.');
+    expect(parsed.get('tool-2')).toBe('the test fails on line 3, so the fixture is wrong.');
+    expect(parsed.has('tool-9')).toBe(false);
+    expect(parsed.size).toBe(2);
+  });
+
+  it('flushPending puts batch answers into the cache and reports failures', async () => {
+    const cache = new Map<string, string>();
+    const errors: string[] = [];
+    const summarizer: Summarizer = {
+      async summarize() {
+        throw new Error('not used');
+      },
+      async summarizeBatch(items) {
+        if (items[0]!.tool_use_id === 'tool-1') throw new Error('fork died');
+        return new Map(items.map((i) => [i.tool_use_id, `  ${i.tool_use_id} sentence.  `]));
+      },
+    };
+    await flushPending(inputs, summarizer, cache, 1, 2, (error) => errors.push(error.message));
+    expect(cache.get('tool-2')).toBe('tool-2 sentence.');
+    expect(cache.has('tool-1')).toBe(false);
+    expect(errors).toEqual(['fork died']);
+  });
+
+  it('flushPending falls back to single questions without a batch method', async () => {
+    const cache = new Map<string, string>();
+    const summarizer: Summarizer = {
+      async summarize(input) {
+        return `${input.tool_use_id} sentence.`;
+      },
+    };
+    await flushPending(inputs, summarizer, cache, 10, 2);
+    expect(cache.get('tool-1')).toBe('tool-1 sentence.');
+    expect(cache.get('tool-2')).toBe('tool-2 sentence.');
   });
 });
 
